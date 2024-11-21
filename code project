@@ -1,0 +1,166 @@
+import sqlite3
+import bcrypt
+import pyotp
+import streamlit as st
+from twilio.rest import Client
+
+import warnings
+warnings.filterwarnings("ignore", message="missing ScriptRunContext")
+
+
+# Twilio Configuration (replace with your Twilio account details)
+TWILIO_PHONE_NUMBER = 'YOUR_TWILIO_PHONE_NUMBER'  # e.g. '+1234567890'
+ACCOUNT_SID = 'YOUR_TWILIO_ACCOUNT_SID'
+AUTH_TOKEN = 'YOUR_TWILIO_AUTH_TOKEN'
+
+# Initialize the Twilio client
+twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
+
+# Initialize the database
+conn = sqlite3.connect("users.db")
+cursor = conn.cursor()
+
+# Create a table for user data
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password BLOB,
+    otp_secret TEXT,
+    phone_number TEXT
+)
+""")
+conn.commit()
+
+# Function to send OTP via SMS
+def send_otp_to_phone(phone_number, otp):
+    try:
+        message = twilio_client.messages.create(
+            body=f"Your OTP is: {otp}",
+            from_=TWILIO_PHONE_NUMBER,
+            to=phone_number
+        )
+        print(f"OTP sent to {phone_number}. SID: {message.sid}")
+    except Exception as e:
+        print(f"Error sending OTP: {str(e)}")
+
+# Function to register a new user
+def register_user(username, password, phone_number):
+    try:
+        # Check if the user already exists
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            return False, "User already exists!"
+        
+        # Hash the password and generate OTP secret
+        hashed_password = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+        otp_secret = pyotp.random_base32()
+        
+        # Insert user into the database
+        cursor.execute("INSERT INTO users (username, password, otp_secret, phone_number) VALUES (?, ?, ?, ?)",
+                       (username, hashed_password, otp_secret, phone_number))
+        conn.commit()
+        return True, f"User '{username}' registered successfully!"
+    except Exception as e:
+        return False, str(e)
+
+# Function to verify password
+def verify_password(password, hashed_password):
+    return bcrypt.checkpw(password.encode("utf-8"), hashed_password)
+
+# Function to login a user
+def login_user(username, password):
+    try:
+        # Fetch user data
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        if not user:
+            return False, "User not found!"
+        
+        # Verify password
+        stored_password = user[1]
+        if not verify_password(password, stored_password):
+            return False, "Invalid password!"
+        
+        # Generate OTP
+        otp = pyotp.TOTP(user[2]).now()
+        phone_number = user[3]  # Get the phone number from the database
+        send_otp_to_phone(phone_number, otp)  # Send OTP to the user's phone
+        return True, otp
+    except Exception as e:
+        return False, str(e)
+
+# Function to verify OTP
+def verify_otp(username, otp):
+    try:
+        # Fetch user data
+        cursor.execute("SELECT otp_secret FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        if not user:
+            return False, "User not found!"
+        
+        # Verify OTP
+        otp_secret = user[0]
+        if pyotp.TOTP(otp_secret).verify(otp):
+            return True, "OTP verified! Login successful."
+        else:
+            return False, "Invalid OTP!"
+    except Exception as e:
+        return False, str(e)
+
+# Streamlit App
+st.title("User Authentication System with SMS OTP")
+
+# Sidebar for navigation
+menu = st.sidebar.radio("Menu", ["Register", "Login", "About"])
+
+# Registration Page
+if menu == "Register":
+    st.subheader("Register a New User")
+    username = st.text_input("Username", key="register_username")
+    password = st.text_input("Password", type="password", key="register_password")
+    phone_number = st.text_input("Phone Number", key="register_phone_number")
+    if st.button("Register"):
+        if username and password and phone_number:
+            success, message = register_user(username, password, phone_number)
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+        else:
+            st.warning("Please provide all the details.")
+
+# Login Page
+elif menu == "Login":
+    st.subheader("User Login")
+    username = st.text_input("Username", key="login_username")
+    password = st.text_input("Password", type="password", key="login_password")
+    if st.button("Login"):
+        if username and password:
+            success, result = login_user(username, password)
+            if success:
+                st.success("Password verified!")
+                st.info(f"An OTP has been sent to your phone.")
+                otp = st.text_input("Enter the OTP:", key="otp_input")
+                if st.button("Verify OTP"):
+                    otp_success, otp_message = verify_otp(username, otp)
+                    if otp_success:
+                        st.success(otp_message)
+                    else:
+                        st.error(otp_message)
+            else:
+                st.error(result)
+        else:
+            st.warning("Please provide both username and password.")
+
+# About Page
+elif menu == "About":
+    st.subheader("About This App")
+    st.write(
+        """
+        This is a user authentication system with:
+        - **Password hashing** for secure storage.
+        - **Two-Factor Authentication (2FA)** using time-based OTPs.
+        - **Twilio SMS integration** for sending OTPs to users.
+        Built using Python, Streamlit, and Twilio.
+        """
+    )
